@@ -1,0 +1,62 @@
+[
+  {
+    "name": "app.Protocol$Request",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Protocol$Response",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Protocol$ResponseError",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Config",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Config$ConnectionConfig",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Config$PoolConfig",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Config$QueryDefaults",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "app.Config$IntrospectDefaults",
+    "allDeclaredFields": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "org.postgresql.Driver",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "com.mysql.cj.jdbc.Driver",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "oracle.jdbc.OracleDriver",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "org.h2.Driver",
+    "allDeclaredConstructors": true
+  }
+]
