@@ -205,10 +205,8 @@ public final class McpServer {
 		ArrayNode required = schema.putArray("required");
 		required.add("sql");
 		ObjectNode outputSchema = tool.putObject("outputSchema");
-		outputSchema.put("type", "object");
-		ObjectNode outputProps = outputSchema.putObject("properties");
-		outputProps.set("structuredContent", buildSqlQueryStructuredSchema());
-		outputProps.putObject("content").put("type", "array");
+		ObjectNode structuredSchema = buildSqlQueryStructuredSchema();
+		outputSchema.setAll(structuredSchema);
 		return tool;
 	}
 
@@ -235,10 +233,8 @@ public final class McpServer {
 		props.putObject("include_columns").put("type", "boolean").put("description", "Include columns and key relationships for matched tables/views.");
 		props.putObject("include_indexes").put("type", "boolean").put("description", "Include index details for matched tables/views.");
 		ObjectNode outputSchema = tool.putObject("outputSchema");
-		outputSchema.put("type", "object");
-		ObjectNode outputProps = outputSchema.putObject("properties");
-		outputProps.set("structuredContent", buildInspectStructuredSchema());
-		outputProps.putObject("content").put("type", "array");
+		ObjectNode structuredSchema = buildInspectStructuredSchema();
+		outputSchema.setAll(structuredSchema);
 		return tool;
 	}
 
