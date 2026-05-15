@@ -66,7 +66,7 @@ public final class SqlService {
 			conn.setReadOnly(true);
 			PreparedStatement stmt = conn.prepareStatement(sql);
 			applyParams(stmt, params);
-			applyStatementLimits(stmt, resolved.maxRows, resolved.timeoutMs, null);
+			applyStatementLimits(stmt, resolved.maxRows + 1, resolved.timeoutMs, null);
 			ResultSet resultSet = stmt.executeQuery();
 			return readResultSet(resultSet, resolved.maxRows, offset);
 		}
@@ -87,7 +87,12 @@ public final class SqlService {
 			boolean hasResultSet = stmt.execute();
 			if (hasResultSet) {
 				ResultSet resultSet = stmt.getResultSet();
-				return readResultSet(resultSet, resolved.maxRows, null);
+				ObjectNode payload = readResultSet(resultSet, resolved.maxRows, null);
+				Integer actualRowCount = findNextUpdateCount(stmt);
+				if (actualRowCount != null) {
+					payload.put("rowCount", actualRowCount);
+				}
+				return payload;
 			}
 			int count = stmt.getUpdateCount();
 			ObjectNode payload = mapper.createObjectNode();
@@ -121,6 +126,10 @@ public final class SqlService {
 			if (hasResultSet) {
 				ResultSet resultSet = stmt.getResultSet();
 				ObjectNode payload = readResultSet(resultSet, previewLimit, null);
+				Integer actualRowCount = findNextUpdateCount(stmt);
+				if (actualRowCount != null) {
+					payload.put("rowCount", actualRowCount);
+				}
 				payload.put("previewLimit", previewLimit);
 				return payload;
 			}
@@ -219,7 +228,7 @@ public final class SqlService {
 			col.put("nullable", meta.isNullable(i) != ResultSetMetaData.columnNoNulls);
 		}
 		ArrayNode rows = payload.putArray("rows");
-		int count = 0;
+		int rowCount = 0;
 		int skipped = 0;
 		int targetOffset = offset == null ? 0 : Math.max(0, offset);
 		while (resultSet.next()) {
@@ -232,25 +241,37 @@ public final class SqlService {
 				Object value = resultSet.getObject(i);
 				row.add(mapper.valueToTree(normalizeValue(value)));
 			}
-			count++;
-			if (count >= maxRows) {
+			rowCount++;
+			if (rowCount >= maxRows) {
 				break;
 			}
 		}
 		boolean truncated = false;
-		if (count >= maxRows) {
-			if (resultSet.next()) {
-				truncated = true;
-			}
+		if (rowCount >= maxRows && resultSet.next()) {
+			truncated = true;
 		}
-		payload.put("rowCount", count);
+		payload.put("rowCount", rowCount);
 		if (targetOffset > 0) {
 			payload.put("offset", targetOffset);
 		}
 		if (truncated) {
 			payload.put("truncated", true);
+			payload.put("maxRows", maxRows);
 		}
 		return payload;
+	}
+
+	private Integer findNextUpdateCount(PreparedStatement stmt) throws SQLException {
+		while (true) {
+			boolean hasMoreResults = stmt.getMoreResults();
+			int updateCount = stmt.getUpdateCount();
+			if (updateCount >= 0) {
+				return updateCount;
+			}
+			if (!hasMoreResults && updateCount == -1) {
+				return null;
+			}
+		}
 	}
 
 	private Object normalizeValue(Object value) {

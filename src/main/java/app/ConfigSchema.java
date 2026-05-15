@@ -85,7 +85,7 @@ public final class ConfigSchema {
 		queryProps.putObject("fetch_size").put("type", "integer").put("minimum", 1).put("description", "Optional JDBC fetch size.");
 		queryProps.putObject("preview_max_rows").put("type", "integer").put("minimum", 1).put("description", "Maximum rows returned by preview DML.");
 		queryProps.putObject("preview_display_rows").put("type", "integer").put("minimum", 1).put("description", "Rows shown by default in preview HTML.");
-		queryProps.putObject("include_select_review").put("type", "boolean").put("default", false).put("description", "Include review HTML for SELECT results.");
+		queryProps.putObject("include_select_review").put("type", "boolean").put("default", true).put("description", "Include review HTML for SELECT results.");
 
 		ObjectNode introspect = props.putObject("introspect");
 		introspect.put("type", "object");

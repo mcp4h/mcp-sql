@@ -343,7 +343,7 @@ public final class Config {
 			this.fetchSize = null;
 			this.previewMaxRows = null;
 			this.previewDisplayRows = 10;
-			this.includeSelectReview = false;
+			this.includeSelectReview = true;
 		}
 
 		public QueryDefaults(QueryDefaults other) {

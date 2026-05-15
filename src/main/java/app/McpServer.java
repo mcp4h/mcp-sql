@@ -16,7 +16,6 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
-import java.util.LinkedHashMap;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -24,7 +23,6 @@ public final class McpServer {
 	private final ObjectMapper mapper = new ObjectMapper();
 	private Config config = Config.defaultConfig();
 	private final SqlService sqlService = new SqlService(mapper, config);
-	private final PreviewCache previewCache = new PreviewCache(100);
 
 	public void run() throws Exception {
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
@@ -81,8 +79,8 @@ public final class McpServer {
 			ObjectNode meta = mapper.createObjectNode();
 			meta.set("requested_scopes", mapper.valueToTree(e.requestedScopes));
 			meta.put("preview", true);
-			if (e.reviewUri != null) {
-				meta.put("reviewUri", e.reviewUri);
+			if (e.resourceUri != null) {
+				meta.putObject("ui").put("resourceUri", e.resourceUri);
 			}
 			resp.error._meta = meta;
 			return resp;
@@ -267,14 +265,7 @@ public final class McpServer {
 			String requiredScope = scopeForSqlType(sqlType);
 			ScopeCheck scopeCheck = checkScopes(requiredScope, metaNode);
 			if (!scopeCheck.allowed && !scopeCheck.dynamicScopes && preview) {
-				long started = System.nanoTime();
-				ObjectNode structured = executeByType(sqlType, sql, arguments, null, maxRows, offset, policy, true);
-				long runtimeMs = Math.max(0, (System.nanoTime() - started) / 1_000_000);
-				String actionLabel = actionLabel(sqlType, sql);
-				String previewUri = null;
-				String html = buildPreviewHtml(structured, actionLabel, runtimeMs, previewDisplayRows());
-				previewUri = previewCache.store(html);
-				throw new PreviewScopesRequiredException(scopeCheck.requestedScopes, previewUri);
+				throw new PreviewScopesRequiredException(scopeCheck.requestedScopes, staticPreviewResourceUri());
 			}
 			if (!scopeCheck.allowed && !scopeCheck.dynamicScopes) {
 				throw new ScopeRequiredException(scopeCheck.requestedScopes);
@@ -286,14 +277,13 @@ public final class McpServer {
 			ObjectNode structured = executeByType(sqlType, sql, arguments, null, maxRows, offset, policy, preview);
 			long runtimeMs = Math.max(0, (System.nanoTime() - started) / 1_000_000);
 			String actionLabel = actionLabel(sqlType, sql);
-			String previewUri = null;
+			String resourceUri = null;
 			boolean isDml = sqlType == SqlService.SqlType.DML;
 			boolean includeSelectReview = sqlType == SqlService.SqlType.SELECT && config.query.includeSelectReview;
 			if (preview || isDml || includeSelectReview) {
-				String html = buildPreviewHtml(structured, actionLabel, runtimeMs, previewDisplayRows());
-				previewUri = previewCache.store(html);
+				resourceUri = staticPreviewResourceUri();
 			}
-			ObjectNode metaPayload = buildPreviewMeta(preview, scopeCheck.requestedScopes, previewUri);
+			ObjectNode metaPayload = buildPreviewMeta(preview, scopeCheck.requestedScopes, resourceUri, actionLabel, structured, runtimeMs);
 			return new ToolCallResult(toolSuccess(name, structured, actionLabel, metaPayload), null);
 		}
 		if ("sql_inspect_schema".equals(name)) {
@@ -441,33 +431,33 @@ public final class McpServer {
 		return 10;
 	}
 
-	private ObjectNode toolSuccess(String name, ObjectNode structured, String actionLabel, ObjectNode meta) {
+	private ObjectNode toolSuccess(String name, ObjectNode structured, String actionLabel, ObjectNode meta) throws JsonProcessingException {
 		ObjectNode payload = mapper.createObjectNode();
 		ArrayNode content = payload.putArray("content");
 		ObjectNode text = content.addObject();
 		text.put("type", "text");
-		if (structured.has("rowCount")) {
-			String label = actionLabel == null ? "Affected" : actionLabel;
-			text.put("text", label + " " + structured.path("rowCount").asInt() + " row(s)");
-		} else if (structured.has("objectCount")) {
-			text.put("text", "Found " + structured.path("objectCount").asInt() + " object(s)");
-		} else {
-			text.put("text", name + " completed");
-		}
+		text.put("text", mapper.writeValueAsString(structured));
 		payload.set("structuredContent", structured);
-		if (meta != null && meta.size() > 0) {
-			payload.set("_meta", meta);
+		ObjectNode payloadMeta = meta == null ? mapper.createObjectNode() : meta.deepCopy();
+		payloadMeta.put("displayMessage", buildDisplayMessage(name, structured, actionLabel));
+		if (payloadMeta.size() > 0) {
+			payload.set("_meta", payloadMeta);
 		}
 		return payload;
 	}
 
-	private ObjectNode buildPreviewMeta(boolean preview, List<String> requestedScopes, String previewUri) {
+	private ObjectNode buildPreviewMeta(boolean preview, List<String> requestedScopes, String resourceUri, String actionLabel, ObjectNode structured, long runtimeMs) {
 		ObjectNode meta = mapper.createObjectNode();
 		if (preview) {
 			meta.put("preview", true);
 		}
-		if (previewUri != null) {
-			meta.put("reviewUri", previewUri);
+		if (resourceUri != null) {
+			meta.putObject("ui").put("resourceUri", resourceUri);
+			ObjectNode uiData = meta.putObject("uiData");
+			uiData.put("actionLabel", actionLabel == null ? "Affected" : actionLabel);
+			uiData.put("runtimeMs", runtimeMs);
+			uiData.put("displayRows", previewDisplayRows());
+			uiData.set("structuredContent", structured);
 		}
 		if (requestedScopes != null && !requestedScopes.isEmpty()) {
 			meta.set("requested_scopes", mapper.valueToTree(requestedScopes));
@@ -475,97 +465,52 @@ public final class McpServer {
 		return meta.size() == 0 ? null : meta;
 	}
 
-	private String buildPreviewHtml(ObjectNode structured, String actionLabel, long runtimeMs, int displayRows) {
+	private String buildDisplayMessage(String name, ObjectNode structured, String actionLabel) {
+		if (structured.has("rowCount")) {
+			String label = actionLabel == null ? "Affected" : actionLabel;
+			return label + " " + structured.path("rowCount").asInt() + " row(s)";
+		}
+		if (structured.has("objectCount")) {
+			return "Found " + structured.path("objectCount").asInt() + " object(s)";
+		}
+		return name + " completed";
+	}
+
+	private String staticPreviewResourceUri() {
+		return "ui://sql_query/static";
+	}
+
+	private String buildPreviewHtml() {
 		StringBuilder html = new StringBuilder();
 		html.append("<!doctype html><html><head><meta charset=\"utf-8\"/>");
 		html.append("<style>");
-		html.append("body{font-family:var(--mcp-font-sans, 'IBM Plex Sans', 'Source Sans 3', sans-serif);background:var(--mcp-color-bg,#f7f7f5);color:var(--mcp-color-fg,#1f1f1b);margin:0;padding:24px;}" );
-		html.append(".card{background:var(--mcp-surface,#fff);border:1px solid var(--mcp-color-border,#d1d0ca);border-radius:12px;padding:18px;box-shadow:0 12px 24px rgba(0,0,0,0.08);}" );
-		html.append(".headline{font-family:var(--mcp-font-serif, 'IBM Plex Serif', 'Source Serif 4', serif);font-size:18px;margin:0 0 6px;}" );
-		html.append(".metric{font-weight:600;color:var(--mcp-color-fg,#1f1f1b);}" );
-		html.append(".meta{font-size:12px;color:var(--mcp-color-muted-fg,#4b4a44);margin-bottom:12px;}" );
+		html.append("body{font-family:var(--font-sans, 'Anthropic Sans', sans-serif);background:var(--color-background-tertiary,#faf9f5);color:var(--color-text-primary,#141413);margin:0;padding:24px;}" );
+		html.append(".card{background:var(--color-background-primary,#fff);border:1px solid var(--color-border-primary,rgba(31,30,29,0.4));border-radius:var(--border-radius-xl,12px);padding:18px;box-shadow:var(--shadow-lg,0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1));}" );
+		html.append(".headline{font-family:var(--font-sans, 'Anthropic Sans', sans-serif);font-size:var(--font-heading-lg-size,20px);line-height:var(--font-heading-lg-line-height,1.25);margin:0 0 6px;}" );
+		html.append(".metric{font-weight:var(--font-weight-semibold,600);color:var(--color-text-primary,#141413);}" );
+		html.append(".meta{font-size:var(--font-text-xs-size,12px);line-height:var(--font-text-xs-line-height,1.4);color:var(--color-text-secondary,#3d3d3a);margin-bottom:12px;}" );
 		html.append(".filter{display:flex;align-items:center;gap:8px;margin:4px 0 10px;}" );
-		html.append(".filter input{flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--mcp-color-border,#d1d0ca);background:var(--mcp-color-bg,#f7f7f5);font-size:12px;}" );
-		html.append("table{width:100%;border-collapse:collapse;font-size:13px;}" );
-		html.append("th,td{border-bottom:1px solid var(--mcp-color-border,#d1d0ca);padding:6px 8px;text-align:left;vertical-align:top;}" );
-		html.append("th{background:var(--mcp-color-bg,#f7f7f5);font-weight:600;}" );
-		html.append(".warn{margin-top:10px;color:var(--mcp-color-warning,#b45309);font-size:12px;}" );
+		html.append(".filter input{flex:1;padding:6px 8px;border-radius:var(--border-radius-sm,6px);border:1px solid var(--color-border-primary,rgba(31,30,29,0.4));background:var(--color-background-secondary,#f5f4ed);color:var(--color-text-primary,#141413);font-size:var(--font-text-xs-size,12px);line-height:var(--font-text-xs-line-height,1.4);}" );
+		html.append("table{width:100%;border-collapse:collapse;font-size:var(--font-text-sm-size,14px);line-height:var(--font-text-sm-line-height,1.4);}" );
+		html.append("th,td{border-bottom:1px solid var(--color-border-tertiary,rgba(31,30,29,0.15));padding:6px 8px;text-align:left;vertical-align:top;}" );
+		html.append("th{background:var(--color-background-secondary,#f5f4ed);font-weight:var(--font-weight-semibold,600);color:var(--color-text-primary,#141413);}" );
+		html.append(".warn{margin-top:10px;color:var(--color-text-warning,#5a4815);font-size:var(--font-text-xs-size,12px);line-height:var(--font-text-xs-line-height,1.4);}" );
 		html.append("tr.ctx-row{display:none;}" );
 		html.append("tr.ctx-row.ctx-open{display:table-row;}" );
-		html.append("tr.ctx-toggle td{padding:4px 6px;background:color-mix(in srgb, var(--mcp-color-bg,#f7f7f5) 92%, var(--mcp-color-border,#d1d0ca) 8%);border-bottom:1px dashed var(--mcp-color-border,#d1d0ca);}" );
+		html.append("tr.ctx-toggle td{padding:4px 6px;background:color-mix(in srgb, var(--color-background-secondary,#f5f4ed) 92%, var(--color-border-primary,rgba(31,30,29,0.4)) 8%);border-bottom:1px dashed var(--color-border-primary,rgba(31,30,29,0.4));}" );
 		html.append(".ctx-cell{text-align:center;}" );
-		html.append(".ctx-btn{font:inherit;font-size:12px;color:var(--mcp-color-primary,#3b5ccc);background:var(--mcp-color-bg,#f7f7f5);border:1px solid var(--mcp-color-border,#d1d0ca);border-radius:var(--mcp-radius-s,.35rem);padding:2px 8px;cursor:pointer;}" );
+		html.append(".ctx-btn{font:inherit;font-size:var(--font-text-xs-size,12px);line-height:var(--font-text-xs-line-height,1.4);color:var(--color-text-info,#3266ad);background:var(--color-background-primary,#fff);border:1px solid var(--color-border-primary,rgba(31,30,29,0.4));border-radius:var(--border-radius-sm,6px);padding:2px 8px;cursor:pointer;}" );
 		html.append("</style></head><body>");
 		html.append("<div class=\"card\">");
-		int rowCount = structured.path("rowCount").asInt();
-		String headline = (actionLabel == null ? "Affected" : actionLabel) + " Rows: " + rowCount;
-		html.append("<div class=\"headline\"><span class=\"metric\">")
-			.append(escapeHtml(headline))
-			.append("</span></div>");
-		StringBuilder meta = new StringBuilder();
-		meta.append("Runtime: ").append(runtimeMs).append(" ms");
-		if (structured.has("offset")) {
-			meta.append(" | Offset: ").append(structured.path("offset").asInt());
-		}
-		html.append("<div class=\"meta\">").append(escapeHtml(meta.toString())).append("</div>");
-		if (structured.has("columns")) {
-			ArrayNode columns = (ArrayNode) structured.get("columns");
-			ArrayNode rows = (ArrayNode) structured.get("rows");
-			html.append("<div class=\"filter\"><input type=\"text\" placeholder=\"Filter rows\" data-filter /></div>");
-			html.append("<table data-table><thead><tr>");
-			for (JsonNode col : columns) {
-				html.append("<th>").append(escapeHtml(col.path("name").asText())).append("</th>");
-			}
-			html.append("</tr></thead><tbody>");
-			if (rows != null) {
-				int show = Math.max(1, displayRows);
-				int total = rows.size();
-				int cutoff = Math.min(show, total);
-				for (int i = 0; i < cutoff; i++) {
-					JsonNode row = rows.get(i);
-					html.append("<tr class=\"data-row\">");
-					for (JsonNode cell : row) {
-						html.append("<td>").append(escapeHtml(cell.isNull() ? "null" : cell.asText())).append("</td>");
-					}
-					html.append("</tr>");
-				}
-				if (total > cutoff) {
-					int remaining = total - cutoff;
-					html.append("<tr class=\"ctx-toggle\" data-group=\"preview-extra\"><td class=\"ctx-cell\" colspan=\"")
-						.append(columns.size())
-						.append("\"><button class=\"ctx-btn\" data-group=\"preview-extra\" data-collapsed=\"")
-						.append(escapeHtml("Show remaining " + remaining + " rows"))
-						.append("\" data-expanded=\"")
-						.append(escapeHtml("Hide remaining " + remaining + " rows"))
-						.append("\" aria-expanded=\"false\">")
-						.append(escapeHtml("Show remaining " + remaining + " rows"))
-						.append("</button></td></tr>");
-					for (int i = cutoff; i < total; i++) {
-						JsonNode row = rows.get(i);
-						html.append("<tr class=\"ctx-row data-row\" data-group=\"preview-extra\">");
-						for (JsonNode cell : row) {
-							html.append("<td>").append(escapeHtml(cell.isNull() ? "null" : cell.asText())).append("</td>");
-						}
-						html.append("</tr>");
-					}
-				}
-				if (structured.path("truncated").asBoolean(false)) {
-					int limit = structured.has("previewLimit")
-						? structured.path("previewLimit").asInt()
-						: structured.path("rowLimit").asInt(0);
-					String message = "Showing first " + limit + " rows";
-					html.append("<tr><td colspan=\"")
-						.append(columns.size())
-						.append("\" class=\"warn\">")
-						.append(escapeHtml(message))
-						.append("</td></tr>");
-				}
-			}
-			html.append("</tbody></table>");
-		}
+		html.append("<div class=\"headline\"><span class=\"metric\" data-headline></span></div>");
+		html.append("<div class=\"meta\" data-meta></div>");
+		html.append("<div class=\"filter\" data-filter-wrap style=\"display:none\"><input type=\"text\" placeholder=\"Filter rows\" data-filter /></div>");
+		html.append("<table data-table style=\"display:none\"><thead><tr data-columns>");
+		html.append("</tr></thead><tbody data-rows></tbody></table>");
+		html.append("<div class=\"warn\" data-empty style=\"display:none\"></div>");
 		html.append("</div>");
 		html.append("<script>");
-		html.append("(function(){function update(btn,open){btn.textContent=open?btn.getAttribute('data-expanded'):btn.getAttribute('data-collapsed');btn.setAttribute('aria-expanded',open?'true':'false');}function bindToggles(){document.querySelectorAll('button.ctx-btn').forEach(function(btn){update(btn,false);btn.addEventListener('click',function(){var group=btn.getAttribute('data-group');var rows=document.querySelectorAll('tr.ctx-row[data-group=\"'+group+'\"]');var open=btn.getAttribute('aria-expanded')!=='true';rows.forEach(function(row){row.classList.toggle('ctx-open',open);});update(btn,open);});});}function bindFilter(){var input=document.querySelector('[data-filter]');var table=document.querySelector('[data-table]');if(!input||!table){return;}input.addEventListener('input',function(){var query=input.value.toLowerCase();var dataRows=table.querySelectorAll('tr.data-row');var toggleRow=table.querySelector('tr.ctx-toggle');if(query){dataRows.forEach(function(row){row.classList.add('ctx-open');var text=row.textContent.toLowerCase();row.style.display=text.indexOf(query)>=0?'':'none';});if(toggleRow){toggleRow.style.display='none';}}else{dataRows.forEach(function(row){row.style.display='';if(row.classList.contains('ctx-row')){row.classList.remove('ctx-open');}});if(toggleRow){toggleRow.style.display='';}document.querySelectorAll('button.ctx-btn').forEach(function(btn){update(btn,false);});}});}function sortRows(th,idx){var table=th.closest('table');var tbody=table.querySelector('tbody');var toggleRow=tbody.querySelector('tr.ctx-toggle');var hiddenRows=Array.from(tbody.querySelectorAll('tr.ctx-row'));var rows=Array.from(tbody.querySelectorAll('tr.data-row:not(.ctx-row)'));var dir=th.getAttribute('data-dir')==='asc'?'desc':'asc';table.querySelectorAll('th').forEach(function(h){h.removeAttribute('data-dir');});th.setAttribute('data-dir',dir);rows.sort(function(a,b){var av=a.children[idx]?.textContent||'';var bv=b.children[idx]?.textContent||'';return dir==='asc'?av.localeCompare(bv):bv.localeCompare(av);});rows.forEach(function(r){tbody.appendChild(r);});if(toggleRow){tbody.appendChild(toggleRow);}hiddenRows.forEach(function(r){tbody.appendChild(r);});}function bindSort(){document.querySelectorAll('[data-table] thead th').forEach(function(th,idx){th.style.cursor='pointer';th.addEventListener('click',function(){sortRows(th,idx);});});}bindToggles();bindFilter();bindSort();})();");
+		html.append("(function(){function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\\"/g,'&quot;').replace(/'/g,'&#39;');}function update(btn,open){btn.textContent=open?btn.getAttribute('data-expanded'):btn.getAttribute('data-collapsed');btn.setAttribute('aria-expanded',open?'true':'false');}function bindToggles(){document.querySelectorAll('button.ctx-btn').forEach(function(btn){update(btn,false);btn.addEventListener('click',function(){var group=btn.getAttribute('data-group');var rows=document.querySelectorAll('tr.ctx-row[data-group=\\\"'+group+'\\\"]');var open=btn.getAttribute('aria-expanded')!=='true';rows.forEach(function(row){row.classList.toggle('ctx-open',open);});update(btn,open);});});}function bindFilter(){var input=document.querySelector('[data-filter]');var table=document.querySelector('[data-table]');if(!input||!table||table.style.display==='none'){return;}input.addEventListener('input',function(){var query=input.value.toLowerCase();var dataRows=table.querySelectorAll('tr.data-row');var toggleRow=table.querySelector('tr.ctx-toggle');if(query){dataRows.forEach(function(row){row.classList.add('ctx-open');var text=row.textContent.toLowerCase();row.style.display=text.indexOf(query)>=0?'':'none';});if(toggleRow){toggleRow.style.display='none';}}else{dataRows.forEach(function(row){row.style.display='';if(row.classList.contains('ctx-row')){row.classList.remove('ctx-open');}});if(toggleRow){toggleRow.style.display='';}document.querySelectorAll('button.ctx-btn').forEach(function(btn){update(btn,false);});}});}function sortRows(th,idx){var table=th.closest('table');var tbody=table.querySelector('tbody');var toggleRow=tbody.querySelector('tr.ctx-toggle');var hiddenRows=Array.from(tbody.querySelectorAll('tr.ctx-row'));var rows=Array.from(tbody.querySelectorAll('tr.data-row:not(.ctx-row)'));var dir=th.getAttribute('data-dir')==='asc'?'desc':'asc';table.querySelectorAll('th').forEach(function(h){h.removeAttribute('data-dir');});th.setAttribute('data-dir',dir);rows.sort(function(a,b){var av=a.children[idx]&&a.children[idx].textContent||'';var bv=b.children[idx]&&b.children[idx].textContent||'';return dir==='asc'?av.localeCompare(bv):bv.localeCompare(av);});rows.forEach(function(r){tbody.appendChild(r);});if(toggleRow){tbody.appendChild(toggleRow);}hiddenRows.forEach(function(r){tbody.appendChild(r);});}function bindSort(){document.querySelectorAll('[data-table] thead th').forEach(function(th,idx){th.style.cursor='pointer';th.addEventListener('click',function(){sortRows(th,idx);});});}function clearTable(columnsRow,rowsBody){columnsRow.innerHTML='';rowsBody.innerHTML='';}function render(result){var headline=document.querySelector('[data-headline]');var meta=document.querySelector('[data-meta]');var filterWrap=document.querySelector('[data-filter-wrap]');var table=document.querySelector('[data-table]');var columnsRow=document.querySelector('[data-columns]');var rowsBody=document.querySelector('[data-rows]');var empty=document.querySelector('[data-empty]');var uiData=result&&result._meta&&result._meta.uiData||null;var structured=result&&result.structuredContent||uiData&&uiData.structuredContent||null;var actionLabel=uiData&&uiData.actionLabel||'Affected';var runtimeMs=uiData&&typeof uiData.runtimeMs==='number'?uiData.runtimeMs:0;var displayRows=Math.max(1, uiData&&uiData.displayRows||10);clearTable(columnsRow,rowsBody);filterWrap.style.display='none';table.style.display='none';empty.style.display='none';if(!structured){headline.textContent='';meta.textContent='';empty.style.display='block';empty.textContent='No structuredContent available';return;}var rowCount=typeof structured.rowCount==='number'?structured.rowCount:0;headline.textContent=actionLabel+' Rows: '+rowCount;var metaText='Runtime: '+runtimeMs+' ms';if(typeof structured.offset==='number'){metaText+=' | Offset: '+structured.offset;}meta.textContent=metaText;if(Array.isArray(structured.columns)){table.style.display='table';filterWrap.style.display='flex';structured.columns.forEach(function(col){var th=document.createElement('th');th.innerHTML=esc(col&&col.name||'');columnsRow.appendChild(th);});var rows=Array.isArray(structured.rows)?structured.rows:[];var cutoff=Math.min(displayRows, rows.length);for(var i=0;i<cutoff;i++){var tr=document.createElement('tr');tr.className='data-row';(rows[i]||[]).forEach(function(cell){var td=document.createElement('td');td.innerHTML=esc(cell===null?'null':cell);tr.appendChild(td);});rowsBody.appendChild(tr);}if(rows.length>cutoff){var remaining=rows.length-cutoff;var toggle=document.createElement('tr');toggle.className='ctx-toggle';toggle.setAttribute('data-group','preview-extra');var td=document.createElement('td');td.className='ctx-cell';td.colSpan=structured.columns.length;var btn=document.createElement('button');btn.className='ctx-btn';btn.setAttribute('data-group','preview-extra');btn.setAttribute('data-collapsed','Show remaining '+remaining+' rows');btn.setAttribute('data-expanded','Hide remaining '+remaining+' rows');btn.setAttribute('aria-expanded','false');btn.textContent='Show remaining '+remaining+' rows';td.appendChild(btn);toggle.appendChild(td);rowsBody.appendChild(toggle);for(var j=cutoff;j<rows.length;j++){var hidden=document.createElement('tr');hidden.className='ctx-row data-row';hidden.setAttribute('data-group','preview-extra');(rows[j]||[]).forEach(function(cell){var cellTd=document.createElement('td');cellTd.innerHTML=esc(cell===null?'null':cell);hidden.appendChild(cellTd);});rowsBody.appendChild(hidden);}}if(structured.truncated){var limit=typeof structured.maxRows==='number'?structured.maxRows:(typeof structured.previewLimit==='number'?structured.previewLimit:(typeof structured.rowLimit==='number'?structured.rowLimit:0));var warn=document.createElement('tr');var warnTd=document.createElement('td');warnTd.colSpan=structured.columns.length;warnTd.className='warn';warnTd.textContent='Showing first '+limit+' rows';warn.appendChild(warnTd);rowsBody.appendChild(warn);}bindToggles();bindFilter();bindSort();return;}empty.style.display='block';empty.textContent=JSON.stringify(structured,null,2);}var app=new App({name:'sql-preview',version:'1.0.0'});app.ontoolresult=function(result){render(result);};app.connect().catch(function(error){var empty=document.querySelector('[data-empty]');if(empty){empty.style.display='block';empty.textContent=error&&error.message?error.message:'Failed to connect';}});})();");
 		html.append("</script>");
 		html.append("</body></html>");
 		return html.toString();
@@ -585,12 +530,10 @@ public final class McpServer {
 	private ObjectNode resourcesList() {
 		ObjectNode result = mapper.createObjectNode();
 		ArrayNode resources = result.putArray("resources");
-		for (PreviewCache.Entry entry : previewCache.list()) {
-			ObjectNode item = resources.addObject();
-			item.put("uri", entry.uri);
-			item.put("mimeType", "text/html");
-			item.put("title", "SQL Preview");
-		}
+		ObjectNode item = resources.addObject();
+		item.put("uri", staticPreviewResourceUri());
+		item.put("mimeType", "text/html");
+		item.put("title", "SQL Preview");
 		return result;
 	}
 
@@ -600,64 +543,18 @@ public final class McpServer {
 		if (uri == null || uri.isBlank()) {
 			throw new Config.ConfigException("uri is required");
 		}
-		PreviewCache.Entry entry = previewCache.get(uri);
-		if (entry == null) {
+		if (!staticPreviewResourceUri().equals(uri)) {
 			throw new Config.ConfigException("resource not found");
 		}
 		ObjectNode result = mapper.createObjectNode();
 		ArrayNode contents = result.putArray("contents");
 		ObjectNode content = contents.addObject();
-		content.put("uri", entry.uri);
+		content.put("uri", uri);
 		content.put("mimeType", "text/html");
-		content.put("text", entry.html);
+		content.put("text", buildPreviewHtml());
 		return result;
 	}
 
-	private static final class PreviewCache {
-		private final int capacity;
-		private final LinkedHashMap<String, Entry> entries;
-
-		PreviewCache(int capacity) {
-			this.capacity = capacity;
-			this.entries = new LinkedHashMap<>(16, 0.75f, true);
-		}
-
-		synchronized String store(String html) {
-			String id = java.util.UUID.randomUUID().toString();
-			String uri = "ui://sql_query/" + id;
-			entries.put(uri, new Entry(uri, html));
-			trim();
-			return uri;
-		}
-
-		synchronized Entry get(String uri) {
-			return entries.get(uri);
-		}
-
-		synchronized List<Entry> list() {
-			return new ArrayList<>(entries.values());
-		}
-
-		private void trim() {
-			if (capacity <= 0) {
-				return;
-			}
-			while (entries.size() > capacity) {
-				String first = entries.keySet().iterator().next();
-				entries.remove(first);
-			}
-		}
-
-		static final class Entry {
-			final String uri;
-			final String html;
-
-			Entry(String uri, String html) {
-				this.uri = uri;
-				this.html = html;
-			}
-		}
-	}
 
 	private String actionLabel(SqlService.SqlType sqlType, String sql) {
 		return switch (sqlType) {
@@ -728,11 +625,11 @@ public final class McpServer {
 
 	private static final class PreviewScopesRequiredException extends Exception {
 		final List<String> requestedScopes;
-		final String reviewUri;
+		final String resourceUri;
 
-		PreviewScopesRequiredException(List<String> requestedScopes, String reviewUri) {
+		PreviewScopesRequiredException(List<String> requestedScopes, String resourceUri) {
 			this.requestedScopes = requestedScopes;
-			this.reviewUri = reviewUri;
+			this.resourceUri = resourceUri;
 		}
 	}
 
